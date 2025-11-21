@@ -12,7 +12,8 @@ Vec3 = require('vec3')
 
 class MinecraftEnv:
     def __init__(self, username="Agent", host='127.0.0.1', port=25565, 
-                 auth='offline', version='1.21.1', view_range=3):
+                 auth='offline', version='1.21.1', view_range=3, 
+                 home_coords=[0, 64, 0], enable_home=False):
         print(f"Connecting {username}...")
         
         device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -22,6 +23,8 @@ class MinecraftEnv:
         self.pathfinder = require('mineflayer-pathfinder')
         
         self.view_range = view_range
+        self.home_coords = home_coords
+        self.enable_home = enable_home
         self.grid_len = (2 * view_range + 1) ** 3
         self.max_actions = 10
         self.inventory_len = 36
@@ -34,8 +37,13 @@ class MinecraftEnv:
         self.same_pos_counter = 0
         
         self.bot = self.mineflayer.createBot({
-            'host': host, 'port': port, 'username': username, 'auth': auth,
-            'hideErrors': False, 'version': version
+            'host': host, 
+            'port': port, 
+            'username': username, 
+            'auth': auth,
+            'hideErrors': False, 
+            'version': version,
+            'disableChatSigning': True
         })
         
         self.bot.loadPlugin(self.pathfinder.pathfinder)
@@ -57,7 +65,10 @@ class MinecraftEnv:
         @Once(self.bot, 'spawn')
         def on_spawn(this):
             print(f"{username} Spawned!")
-            self.bot.chat("Agent Online.")
+            try:
+                self.bot.chat("Agent Online.")
+            except:
+                pass
             time.sleep(1.0)
             self.is_ready = True
             
@@ -128,7 +139,7 @@ class MinecraftEnv:
     def get_observation(self):
         dummy_vox = torch.zeros((1, 8, self.grid_len), dtype=torch.long)
         dummy_inv = torch.zeros((1, 1, self.inventory_len), dtype=torch.long)
-        dummy_status = torch.zeros((1, 1, 9), dtype=torch.float)
+        dummy_status = torch.zeros((1, 1, 15), dtype=torch.float)
         
         if not self.is_ready:
             return (dummy_vox,
@@ -172,6 +183,22 @@ class MinecraftEnv:
             ]).unsqueeze(0).long()
             
             status_list = list(data['status'])
+            
+            if self.enable_home:
+                current_pos = np.array([status_list[9], status_list[10], status_list[11]])
+                home_vec = np.array(self.home_coords) - current_pos
+                dist_home = np.linalg.norm(home_vec)
+                if dist_home > 0:
+                    dir_home = home_vec / dist_home
+                else:
+                    dir_home = np.zeros(3)
+            else:
+                dir_home = np.zeros(3)
+                
+            status_list.insert(9, dir_home[0])
+            status_list.insert(10, dir_home[1])
+            status_list.insert(11, dir_home[2])
+            
             status = torch.tensor([status_list], dtype=torch.float).unsqueeze(0)
             
             inventory_list = list(data['inventory'])
@@ -181,7 +208,8 @@ class MinecraftEnv:
             self.current_food = status_list[1]
             self.last_wood_count = data['wood_count']
             
-            current_pos = np.array([status_list[9], status_list[10], status_list[11]])
+            current_pos = np.array([status_list[12], status_list[13], status_list[14]])
+            
             if self.last_position is not None:
                 dist = np.linalg.norm(current_pos - self.last_position)
                 if dist < 0.5:
@@ -306,6 +334,30 @@ class MinecraftEnv:
 
                 if self.same_pos_counter > 50:
                     reward -= 0.2 
+
+                if self.enable_home:
+                    dist_to_home = np.linalg.norm(self.last_position - np.array(self.home_coords))
+                    time_of_day = self.bot.time.timeOfDay
+                    is_night = 13000 <= time_of_day <= 23000
+                    
+                    inv_count = 0
+                    if callable(self.bot.inventory.items):
+                         for item in self.bot.inventory.items():
+                             inv_count += item.count
+                    
+                    inv_fullness = inv_count / (36.0 * 64.0)
+                    
+                    if is_night:
+                        if dist_to_home < 10:
+                            reward += 2.0
+                        else:
+                            reward -= 0.1
+                    
+                    if inv_fullness > 0.5:
+                        if dist_to_home < 10:
+                            reward += 5.0
+                        else:
+                            reward += (100 - dist_to_home) * 0.01
                     
             except:
                 pass

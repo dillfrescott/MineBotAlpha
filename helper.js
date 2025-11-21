@@ -1,6 +1,8 @@
 const { goals } = require('mineflayer-pathfinder');
 const Vec3 = require('vec3');
 
+const hostile = new Set();
+
 function getStableId(name) {
     if (!name) return 0;
     let hash = 0;
@@ -9,6 +11,51 @@ function getStableId(name) {
         hash |= 0;
     }
     return Math.abs(hash) % 4096;
+}
+
+function setupListeners(bot) {
+    if (!bot._listenersAttached) {
+        bot._listenersAttached = true;
+
+        bot.on('entitySwing', (entity) => {
+            entity.lastSwung = Date.now();
+        });
+
+        bot.on('entityHurt', (entity) => {
+            if (entity !== bot.entity) return;
+            
+            const now = Date.now();
+            const attacker = Object.values(bot.entities).find(e => {
+                if (e === bot.entity) return false;
+                if (e.type !== 'player') return false;
+                
+                const dist = e.position.distanceTo(bot.entity.position);
+                const timeSinceSwing = now - (e.lastSwung || 0);
+                
+                return dist < 4 && timeSinceSwing < 800;
+            });
+
+            if (attacker) {
+                hostile.add(attacker.username);
+            }
+        });
+
+        bot.on('chat', async (username, message) => {
+            if (username === bot.username) return;
+            
+            const target = bot.players[username] ? bot.players[username].entity : null;
+            if (!target || !target.position) return;
+
+            const dist = target.position.distanceTo(bot.entity.position);
+            if (dist > 10) return;
+
+            const msg = message.toLowerCase();
+            if (msg.includes('hey') || msg.includes('hi') || msg.includes('hello')) {
+                await bot.lookAt(target.position.offset(0, target.height, 0));
+                bot.swingArm();
+            }
+        });
+    }
 }
 
 function hasLineOfSight(bot, target) {
@@ -167,11 +214,15 @@ function getWoodCounts(bot) {
 
 async function attackMob(bot) {
     if (!bot || !bot.entity || !bot.entity.position) return 0;
+    setupListeners(bot);
     
     try {
         const entity = bot.nearestEntity(e => 
-            e && e.position && (e.type === 'mob' || e.type === 'player') && 
-            e.name !== 'sheep' && e.name !== 'cow' && e.name !== 'pig'
+            e && e.position && 
+            (
+                (e.type === 'mob' && e.name !== 'sheep' && e.name !== 'cow' && e.name !== 'pig') ||
+                (e.type === 'player' && hostile.has(e.username))
+            )
         );
 
         if (!entity) return 0;
@@ -249,6 +300,7 @@ async function mineBlock(bot) {
 
 function getObservation(bot, viewRange) {
     if (!bot || !bot.entity || !bot.entity.position) return null;
+    setupListeners(bot);
 
     const center = bot.entity.position.floored();
     
@@ -294,7 +346,7 @@ function getObservation(bot, viewRange) {
         const entity = bot.entities[name];
         if (entity === bot.entity || !entity.position) continue;
         
-        if (entity.type === 'mob' || entity.type === 'player' || entity.type === 'projectile') {
+        if (entity.type === 'mob' || entity.type === 'player' || entity.type === 'projectile' || entity.type === 'object') {
             const dx = Math.floor(entity.position.x - center.x);
             const dy = Math.floor(entity.position.y - center.y);
             const dz = Math.floor(entity.position.z - center.z);
@@ -305,6 +357,13 @@ function getObservation(bot, viewRange) {
                 let entityId = 2000;
                 if (entity.type === 'player') entityId = 2001;
                 if (entity.type === 'projectile') entityId = 2002;
+                if (entity.type === 'object') {
+                    entityId = 2003;
+                    const item = entity.getDroppedItem ? entity.getDroppedItem() : null;
+                    if (item) {
+                        entityId = getStableId(item.name);
+                    }
+                }
 
                 buffer.writeUInt16LE(entityId, data_offset);
                 buffer.writeUInt8(Math.max(0, entity.health || 0), data_offset + 2);
@@ -323,6 +382,10 @@ function getObservation(bot, viewRange) {
                 buffer.writeUInt16LE(feet, data_offset + 11);
                 
                 let nameToHash = entity.username || entity.name || "";
+                if (entity.type === 'object') {
+                    const item = entity.getDroppedItem ? entity.getDroppedItem() : null;
+                    if (item) nameToHash = item.name;
+                }
                 const nameId = getStableId(nameToHash);
                 buffer.writeUInt16LE(nameId, data_offset + 13);
             }

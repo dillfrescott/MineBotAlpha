@@ -1,5 +1,6 @@
 torch
 x-transformers
+titans-pytorch
 prodigyopt
 tqdm
 javascript

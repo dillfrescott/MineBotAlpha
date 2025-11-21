@@ -6,7 +6,9 @@
         "username_train": "AnimeAndRamen",
         "username_inference": "AnimeAndRamen",
         "auth": "microsoft",
-        "view_range": 5
+        "view_range": 6,
+		"home_coords": [-6, 65, -16],
+		"enable_home_base": false
     },
     "model": {
         "num_block_types": 4096,

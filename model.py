@@ -70,7 +70,7 @@ class MinecraftAgent(nn.Module):
         )
         self.spatial_norm = nn.LayerNorm(self.dim)
         
-        self.status_emb = nn.Linear(9 + self.max_actions * 15, self.dim)
+        self.status_emb = nn.Linear(12 + self.max_actions * 15, self.dim)
         
         self.transformer = Encoder(
             dim=self.dim,
@@ -122,8 +122,8 @@ class MinecraftAgent(nn.Module):
         x_vox = x_vox.unsqueeze(1)
         
         raw_status = status.squeeze(1)
-        core_status = raw_status[:, :9]
-        coords = raw_status[:, 9:]
+        core_status = raw_status[:, :12]
+        coords = raw_status[:, 12:]
         
         x_coords = self.coord_emb(coords).unsqueeze(1)
         

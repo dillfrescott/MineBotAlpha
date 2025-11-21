@@ -102,7 +102,9 @@ async def train():
             port=mc_cfg['port'],
             auth=mc_cfg['auth'],
             version=mc_cfg['version'],
-            view_range=mc_cfg['view_range']
+            view_range=mc_cfg['view_range'],
+            home_coords=mc_cfg.get('home_coords', [0, 64, 0]),
+            enable_home=mc_cfg.get('enable_home_base', False)
         )
     
     env = create_env()
@@ -197,7 +199,6 @@ async def train():
                 returns.insert(0, R)
             returns = torch.tensor(returns, dtype=torch.float32, device=device)
             
-            # Ensure next_hx_target has correct shape by squeezing if necessary
             next_hx_target = torch.cat(buffer['next_hx']).to(device)
             if next_hx_target.dim() > 2: 
                  next_hx_target = next_hx_target.squeeze(1)
