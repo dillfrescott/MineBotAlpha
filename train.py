@@ -10,17 +10,19 @@ from model import MinecraftAgent
 from bot_env import MinecraftEnv
 import asyncio
 import sys
+import numpy as np
 
-class A2CAgent:
-    def __init__(self, model, lr=1.0, value_coef=0.5, entropy_coef=0.01, dynamics_coef=0.5):
+class SPOAgent:
+    def __init__(self, model, lr=1.0, value_coef=0.5, entropy_coef=0.03, dynamics_coef=0.5, d_max=0.01):
         self.model = model
         self.optimizer = Prodigy(model.parameters(), lr=lr)
         self.value_coef = value_coef
         self.entropy_coef = entropy_coef
         self.dynamics_coef = dynamics_coef
+        self.d_max = d_max
     
     def act(self, voxels, status, inventory, action_history, hx):
-        action_logits, craft_logits, value, next_hx, _, _ = self.model(voxels, status, inventory, action_history, hx)
+        action_logits, craft_logits, value, next_hx, pred_next_states, _ = self.model(voxels, status, inventory, action_history, hx)
         
         action_dist = torch.distributions.Categorical(logits=action_logits)
         craft_dist = torch.distributions.Categorical(logits=craft_logits)
@@ -33,7 +35,7 @@ class A2CAgent:
         
         entropy = action_dist.entropy().mean() + craft_dist.entropy().mean()
         
-        return (action, craft_action), (action_logp, craft_logp), value, entropy, next_hx
+        return (action, craft_action), (action_logp, craft_logp), value, entropy, next_hx, pred_next_states
     
     def update(self, batch):
         vox, stat, inv, act_hist, hx, old_logps, actions, returns, next_hx_target = batch
@@ -57,14 +59,29 @@ class A2CAgent:
         
         entropy = action_dist.entropy().mean() + craft_dist.entropy().mean()
         
-        advantages = returns - values
+        ratio_action = torch.exp(action_logp - action_logp_old)
+        ratio_craft = torch.exp(craft_logp - craft_logp_old)
         
-        policy_loss = -(action_logp * advantages.detach()).mean() - (craft_logp * advantages.detach()).mean()
+        kl_action = action_logp_old - action_logp
+        kl_craft = craft_logp_old - craft_logp
+        
+        advantages = returns - values.detach()
+        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+        
+        surr_action = ratio_action * advantages
+        surr_craft = ratio_craft * advantages
+        
+        mask_action = (kl_action <= self.d_max).float().detach()
+        mask_craft = (kl_craft <= self.d_max).float().detach()
+        
+        policy_loss_action = -(surr_action * mask_action).mean()
+        policy_loss_craft = -(surr_craft * mask_craft).mean()
+        
+        policy_loss = policy_loss_action + policy_loss_craft
         
         value_loss = F.mse_loss(values, returns)
         
         batch_indices = torch.arange(pred_next_states.size(0), device=device)
-        
         selected_next_states = pred_next_states[batch_indices, action_old]
         selected_rewards = pred_rewards[batch_indices, action_old].squeeze(-1)
         
@@ -91,7 +108,7 @@ async def train():
     sys.setrecursionlimit(2000)
     
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Training on {device}")
+    print(f"Training on {device} using SPO + Intrinsic Curiosity")
     
     os.makedirs(train_cfg['checkpoint_dir'], exist_ok=True)
 
@@ -110,7 +127,8 @@ async def train():
     env = create_env()
     
     model = MinecraftAgent(cfg['model']).to(device)
-    agent = A2CAgent(model, lr=train_cfg['learning_rate'])
+    
+    agent = SPOAgent(model, lr=train_cfg['learning_rate'])
     
     checkpoint_path = os.path.join(train_cfg['checkpoint_dir'], "minecraft_agent.pth")
     start_step = 0
@@ -133,10 +151,20 @@ async def train():
 
     save_interval = train_cfg.get('save_interval', 1000)
     update_batch_size = train_cfg.get('update_batch_size', 100)
+    curiosity_weight = 0.02
 
     pbar = tqdm(initial=start_step, position=0, leave=True)
     
     global_step = start_step
+    
+    if not env.is_ready:
+         while not env.is_ready:
+             await asyncio.sleep(1)
+
+    obs_vox, obs_stat, obs_inv, obs_hist = env.get_observation()
+    
+    if hx is None:
+        hx = torch.zeros(1, model.dim, device=device)
 
     while True:
         pbar.set_description(f"Step {global_step}")
@@ -146,44 +174,65 @@ async def train():
             'actions': [], 'logps': [], 'rewards': [], 'values': [], 'next_hx': []
         }
         
+        total_intrinsic = 0
+        total_extrinsic = 0
+        
         try:
             for _ in range(update_batch_size):
                 if not env.is_ready:
                     print("Environment not ready, waiting...")
                     await asyncio.sleep(5)
+                    obs_vox, obs_stat, obs_inv, obs_hist = env.get_observation()
                     continue
-
-                vox, stat, inv, act_hist = env.get_observation()
                 
                 with torch.no_grad():
-                    if hx is None:
-                        hx = torch.zeros(1, model.dim, device=device)
-                        
-                    actions, logps, value, entropy, next_hx = agent.act(
-                        vox.to(device),
-                        stat.to(device),
-                        inv.to(device),
-                        act_hist.to(device),
+                    actions, logps, value, entropy, next_hx_pred, pred_next_states = agent.act(
+                        obs_vox.to(device),
+                        obs_stat.to(device),
+                        obs_inv.to(device),
+                        obs_hist.to(device),
                         hx
                     )
                 
                 action, craft_action = actions
                 action_logp, craft_logp = logps
                 
-                reward = await env.step_atomic(action, craft_action)
+                extrinsic_reward = await env.step_atomic(action, craft_action)
                 
-                buffer['vox'].append(vox)
-                buffer['stat'].append(stat)
-                buffer['inv'].append(inv)
-                buffer['act_hist'].append(act_hist)
+                next_vox, next_stat, next_inv, next_hist = env.get_observation()
+                
+                with torch.no_grad():
+                    _, _, _, _, real_next_hx, _ = agent.act(
+                        next_vox.to(device),
+                        next_stat.to(device),
+                        next_inv.to(device),
+                        next_hist.to(device),
+                        hx
+                    )
+
+                predicted_vector = pred_next_states[0, action.item()]
+                surprise = F.mse_loss(predicted_vector, real_next_hx[0])
+                intrinsic_reward = surprise.item() * curiosity_weight
+                
+                total_reward = extrinsic_reward + intrinsic_reward
+                
+                total_extrinsic += extrinsic_reward
+                total_intrinsic += intrinsic_reward
+                
+                buffer['vox'].append(obs_vox)
+                buffer['stat'].append(obs_stat)
+                buffer['inv'].append(obs_inv)
+                buffer['act_hist'].append(obs_hist)
                 buffer['hx'].append(hx)
                 buffer['actions'].append((action.cpu(), craft_action.cpu()))
                 buffer['logps'].append((action_logp.cpu(), craft_logp.cpu()))
-                buffer['rewards'].append(reward)
+                buffer['rewards'].append(total_reward)
                 buffer['values'].append(value.cpu())
-                buffer['next_hx'].append(next_hx.detach().cpu()) 
+                buffer['next_hx'].append(real_next_hx.detach().cpu()) 
                 
-                hx = next_hx.detach()
+                hx = real_next_hx.detach()
+                
+                obs_vox, obs_stat, obs_inv, obs_hist = next_vox, next_stat, next_inv, next_hist
 
                 global_step += 1
                 pbar.update(1)
@@ -219,9 +268,9 @@ async def train():
             
             loss, p_loss, v_loss, ent, dyn_loss = agent.update(batch)
             pbar.set_postfix({
-                "Rew": f"{sum(buffer['rewards']):.1f}",
+                "Ext": f"{total_extrinsic:.1f}",
+                "Int": f"{total_intrinsic:.2f}",
                 "Loss": f"{loss:.2f}",
-                "Dyn": f"{dyn_loss:.2f}"
             })
             
             if global_step % save_interval < update_batch_size:
@@ -240,6 +289,7 @@ async def train():
                 except: pass
                 env = create_env()
                 await asyncio.sleep(5)
+                obs_vox, obs_stat, obs_inv, obs_hist = env.get_observation()
             else:
                 print(f"Training error: {e}")
                 import traceback

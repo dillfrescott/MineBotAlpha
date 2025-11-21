@@ -70,7 +70,7 @@ class MinecraftAgent(nn.Module):
         )
         self.spatial_norm = nn.LayerNorm(self.dim)
         
-        self.status_emb = nn.Linear(25 + self.max_actions * 15, self.dim)
+        self.status_emb = nn.Linear(26 + self.max_actions * 15, self.dim)
         
         self.transformer = Encoder(
             dim=self.dim,

@@ -4,6 +4,7 @@ import torch
 import base64
 import math
 import numpy as np
+import random
 from javascript import require, Once, On
 from threading import BrokenBarrierError
 import asyncio
@@ -32,7 +33,7 @@ class MinecraftEnv:
         self.last_food = 20.0
         self.current_health = 20.0
         self.current_food = 20.0
-        self.last_wood_count = 0
+        
         self.last_position = None
         self.same_pos_counter = 0
         
@@ -50,8 +51,6 @@ class MinecraftEnv:
         self.tool = require('mineflayer-tool').Tool(self.bot)
         self.is_ready = False
         self.action_history = torch.zeros(self.max_actions, 15, device=device)
-        
-        self.wood_sources = ['oak_log', 'birch_log', 'spruce_log', 'jungle_log', 'acacia_log', 'dark_oak_log']
         
         @On(self.bot, 'end')
         def on_end(this, reason):
@@ -113,16 +112,13 @@ class MinecraftEnv:
             for recipe in craftable_recipes:
                 item_name = self.bot.registry.items[recipe.result.id].name
                 value = 1.0 
-                if 'sword' in item_name: value = 10.0
-                elif 'axe' in item_name: value = 8.0
-                elif 'pickaxe' in item_name: value = 8.0
-                elif 'shovel' in item_name: value = 5.0
-                elif 'shield' in item_name: value = 15.0
-                elif 'planks' in item_name: value = 3.0
-                elif 'stick' in item_name: value = 2.0
-                elif 'ingot' in item_name: value = 5.0
-                elif 'block' in item_name: value = 3.0
-                elif 'cooked' in item_name: value = 7.0
+                
+                if 'diamond' in item_name: value = 50.0
+                elif 'furnace' in item_name: value = 5.0
+                elif 'crafting_table' in item_name: value = 5.0
+                elif 'pickaxe' in item_name: value = 5.0
+                elif 'sword' in item_name: value = 5.0
+                elif 'cooked' in item_name: value = 5.0
                 
                 if value > best_value:
                     best_value = value
@@ -199,6 +195,9 @@ class MinecraftEnv:
             status_list.insert(11, dir_home[1])
             status_list.insert(12, dir_home[2])
             
+            while len(status_list) < 28:
+                status_list.append(0.0)
+            
             status = torch.tensor([status_list], dtype=torch.float).unsqueeze(0)
             
             inventory_list = list(data['inventory'])
@@ -206,7 +205,6 @@ class MinecraftEnv:
             
             self.current_health = status_list[0]
             self.current_food = status_list[1]
-            self.last_wood_count = data['wood_count']
             
             current_pos = np.array([status_list[13], status_list[14], status_list[15]])
             
@@ -237,21 +235,24 @@ class MinecraftEnv:
                 await self.helper.moveControl(bot, "back", 200)
 
             elif action_type == 2:
-                if self.current_health < 10 and bot.food > 8:
-                    if callable(bot.inventory.items):
-                        inventory_items = bot.inventory.items()
-                    elif isinstance(bot.inventory.items, list):
-                        inventory_items = bot.inventory.items
-                    else:
-                        inventory_items = []
+                            if bot.food < 20 or self.current_health < 20:
+                                if callable(bot.inventory.items):
+                                    inventory_items = bot.inventory.items()
+                                elif isinstance(bot.inventory.items, list):
+                                    inventory_items = bot.inventory.items
+                                else:
+                                    inventory_items = []
 
-                    food_item = next((i for i in inventory_items
-                        if i.name in ['cooked_beef', 'cooked_porkchop', 'bread']), None)
-                        
-                    if food_item:
-                        bot.equip(food_item, 'hand')
-                        bot.activateItem()
-                        reward += 3.0
+                                food_item = next((i for i in inventory_items
+                                    if i.name in ['cooked_beef', 'cooked_porkchop', 'bread', 'apple', 'carrot', 'baked_potato']), None)
+                                    
+                                if food_item:
+                                    try:
+                                        bot.equip(food_item, 'hand')
+                                        bot.consume()
+                                        reward += 3.0
+                                    except:
+                                        pass
 
             elif action_type == 3:
                 await self.helper.moveControl(bot, "forward", 500)
@@ -277,10 +278,15 @@ class MinecraftEnv:
                 bot.look(yaw, bot.entity.pitch)
             
             elif action_type == 10:
-                reward += await self.helper.mineBlock(self.bot)
+                result = await self.helper.mineBlock(self.bot)   
+                if result <= 0:
+                    reward -= 2.0
+                else:
+                    reward += result
                 
             elif action_type == 11:
-                reward += await self.helper.attackMob(self.bot)
+                success = await self.helper.placeBlock(self.bot)
+                if success: reward += 1.0
             
             elif action_type == 12:
                 await self.helper.equipBestGear(self.bot)
@@ -306,58 +312,63 @@ class MinecraftEnv:
         reward = 0
         
         try:
-            reward += await self.execute_action(action.item())
+            if self.same_pos_counter > 30:
+                rnd_yaw = (random.random() * 6.28) - 3.14
+                self.bot.look(rnd_yaw, 0)
+                await self.helper.sprintJump(self.bot, 500)
+                self.same_pos_counter = 0
+                reward -= 1.0
+            else:
+                reward += await self.execute_action(action.item())
+
+            current_pos = np.array([self.bot.entity.position.x, self.bot.entity.position.y, self.bot.entity.position.z])
+            if self.last_position is not None:
+                dist = np.linalg.norm(current_pos - self.last_position)
+                
+                if dist > 0.1:
+                    reward += dist * 0.05
+
+                if dist < 0.1 and action.item() == 3:
+                    reward -= 0.1
             
             if craft_action.item() == 0:
                 if self.craft_any_item():
-                    reward += 10.0
+                    reward += 5.0
             
-            if self.last_wood_count > 0:
-                reward += 0.1
-                
+            if craft_action.item() == 1:
+                success = await self.helper.smeltItem(self.bot)
+                if success:
+                    reward += 10.0
+
             try:
                 if self.current_food < 6:
                     reward -= 0.5
                 elif self.current_food == 0:
-                    reward -= 2.0
+                    reward -= 5.0
                     
                 if self.current_health < 5:
-                    reward -= 1.0
+                    reward -= 2.0
                     
                 damage_taken = max(0, self.last_health - self.current_health)
                 if damage_taken > 0:
-                    reward -= damage_taken * 5.0
+                    reward -= damage_taken * 10.0
                     
                 health_gained = max(0, self.current_health - self.last_health)
                 if health_gained > 0:
-                    reward += health_gained * 1.5
+                    reward += health_gained * 2.0
 
-                if self.same_pos_counter > 50:
-                    reward -= 0.2 
-
-                if self.enable_home:
-                    dist_to_home = np.linalg.norm(self.last_position - np.array(self.home_coords))
-                    time_of_day = self.bot.time.timeOfDay
-                    is_night = 13000 <= time_of_day <= 23000
+                if self.same_pos_counter > 10:
+                    penalty = 0.05 * (1.1 ** (self.same_pos_counter - 10))
+                    reward -= penalty
                     
-                    inv_count = 0
-                    if callable(self.bot.inventory.items):
-                         for item in self.bot.inventory.items():
-                             inv_count += item.count
+                if self.current_food <= 6 and self.same_pos_counter > 10:
+                    reward -= 1.0
                     
-                    inv_fullness = inv_count / (36.0 * 64.0)
-                    
-                    if is_night:
-                        if dist_to_home < 10:
-                            reward += 2.0
-                        else:
-                            reward -= 0.1
-                    
-                    if inv_fullness > 0.5:
-                        if dist_to_home < 10:
-                            reward += 5.0
-                        else:
-                            reward += (100 - dist_to_home) * 0.01
+                vel = self.bot.entity.velocity
+                horizontal_speed = (vel.x**2 + vel.z**2)**0.5
+                
+                if action.item() in [3, 13] and horizontal_speed < 0.05:
+                     reward -= 0.5
                     
             except:
                 pass

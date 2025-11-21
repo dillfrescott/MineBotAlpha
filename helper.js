@@ -94,8 +94,10 @@ function setupListeners(bot) {
 
             const msg = message.toLowerCase();
             if (msg.includes('hey') || msg.includes('hi') || msg.includes('hello')) {
-                await bot.lookAt(target.position.offset(0, target.height, 0));
-                bot.swingArm();
+                try {
+                    await bot.lookAt(target.position.offset(0, target.height, 0));
+                    bot.swingArm();
+                } catch (e) {}
             }
         });
     }
@@ -128,29 +130,53 @@ function hasLineOfSight(bot, target) {
 async function moveControl(bot, control, ms) {
     if (!bot || !bot.entity) return;
     try {
-        if (bot.pathfinder) bot.pathfinder.stop();
+        if (bot.pathfinder && bot.pathfinder.isMoving) {
+            bot.pathfinder.stop();
+        }
     } catch (e) {}
     
-    bot.setControlState(control, true);
-    await new Promise(resolve => setTimeout(resolve, ms));
-    bot.setControlState(control, false);
+    try {
+        bot.setControlState(control, true);
+
+        if (['forward', 'left', 'right'].includes(control)) {
+            const checkInterval = setInterval(() => {
+                if (bot.entity.isCollidedHorizontally) {
+                    bot.setControlState('jump', true);
+                } else {
+                    bot.setControlState('jump', false);
+                }
+            }, 50);
+
+            await new Promise(resolve => setTimeout(resolve, ms));
+            clearInterval(checkInterval);
+        } else {
+            await new Promise(resolve => setTimeout(resolve, ms));
+        }
+
+        bot.setControlState(control, false);
+        bot.setControlState('jump', false);
+    } catch (e) {}
 }
 
 async function sprintJump(bot, ms) {
     if (!bot || !bot.entity) return;
     try {
-        if (bot.pathfinder) bot.pathfinder.stop();
+        if (bot.pathfinder && bot.pathfinder.isMoving) {
+            bot.pathfinder.stop();
+        }
     } catch (e) {}
     
-    bot.setControlState('forward', true);
-    bot.setControlState('sprint', true);
-    bot.setControlState('jump', true);
-    
-    await new Promise(resolve => setTimeout(resolve, ms));
-    
-    bot.setControlState('forward', false);
-    bot.setControlState('sprint', false);
-    bot.setControlState('jump', false);
+    try {
+        bot.setControlState('forward', true);
+        bot.setControlState('sprint', true);
+        bot.setControlState('jump', true);
+        
+        await new Promise(resolve => setTimeout(resolve, ms));
+        
+        bot.setControlState('forward', false);
+        bot.setControlState('sprint', false);
+        bot.setControlState('jump', false);
+    } catch (e) {}
 }
 
 async function randomWander(bot, radius) {
@@ -171,7 +197,7 @@ async function randomWander(bot, radius) {
         ]);
         return true;
     } catch (e) {
-        bot.pathfinder.stop();
+        try { bot.pathfinder.stop(); } catch(err) {}
         return false;
     }
 }
@@ -242,22 +268,90 @@ async function equipBestGear(bot) {
 }
 
 function getResourceSummary(bot) {
-    if (!bot || !bot.inventory) return { wood: 0, stone: 0, iron: 0, food: 0 };
+    if (!bot || !bot.inventory) return { wood: 0, stone: 0, iron_ore: 0, iron_ingot: 0, diamond: 0, raw_food: 0, cooked_food: 0 };
     
     const items = bot.inventory.items();
     let wood = 0;
     let stone = 0;
-    let iron = 0;
-    let food = 0;
+    let iron_ore = 0;
+    let iron_ingot = 0;
+    let diamond = 0;
+    let raw_food = 0;
+    let cooked_food = 0;
     
     for (const item of items) {
         if (item.name.includes('log') || item.name.includes('planks')) wood += item.count;
         if (item.name.includes('cobblestone') || item.name.includes('stone')) stone += item.count;
-        if (item.name.includes('iron_ingot') || item.name.includes('iron_ore')) iron += item.count;
-        if (item.name.includes('beef') || item.name.includes('pork') || item.name.includes('chicken') || item.name.includes('bread') || item.name.includes('apple')) food += item.count;
+        
+        if (item.name.includes('iron_ore') || item.name.includes('raw_iron')) iron_ore += item.count;
+        if (item.name.includes('iron_ingot')) iron_ingot += item.count;
+        
+        if (item.name.includes('diamond')) diamond += item.count;
+        
+        if (item.name.includes('beef') || item.name.includes('pork') || item.name.includes('chicken') || item.name.includes('mutton') || item.name.includes('rabbit')) {
+            if (item.name.includes('cooked')) cooked_food += item.count;
+            else raw_food += item.count;
+        }
+        if (item.name.includes('bread') || item.name.includes('apple')) cooked_food += item.count;
     }
     
-    return { wood, stone, iron, food };
+    return { wood, stone, iron_ore, iron_ingot, diamond, raw_food, cooked_food };
+}
+
+async function placeBlock(bot) {
+    if (!bot || !bot.entity) return false;
+    try {
+        const heldItem = bot.inventory.slots[bot.getEquipmentDestSlot('hand')];
+        if (!heldItem || heldItem.type === 0) return false;
+        
+        const refBlock = bot.findBlock({
+            matching: block => block && block.type !== 0 && block.boundingBox === 'block',
+            maxDistance: 3.5
+        });
+        
+        if (refBlock) {
+            const face = new Vec3(0, 1, 0);
+            try {
+                await bot.placeBlock(refBlock, face);
+                return true;
+            } catch (e) {}
+        }
+    } catch (e) {}
+    return false;
+}
+
+async function smeltItem(bot) {
+    if (!bot || !bot.entity) return false;
+    
+    const items = bot.inventory.items();
+    const smeltables = items.filter(i => i.name.includes('raw') || i.name.includes('ore') || i.name === 'potato' || i.name === 'kelp');
+    const fuels = items.filter(i => i.name.includes('coal') || i.name.includes('plank') || i.name.includes('log') || i.name === 'charcoal');
+    
+    let furnaceBlock = bot.findBlock({ matching: bot.registry.blocksByName.furnace.id, maxDistance: 4 });
+    
+    if (!furnaceBlock || smeltables.length === 0 || fuels.length === 0) return false;
+    
+    try {
+        const furnace = await bot.openFurnace(furnaceBlock);
+        
+        if (furnace.outputItem) {
+            await furnace.takeOutput();
+        }
+        
+        if (smeltables.length > 0 && !furnace.inputItem) {
+            await furnace.putInput(smeltables[0]);
+        }
+        
+        if (fuels.length > 0 && !furnace.fuelItem) {
+             await furnace.putFuel(fuels[0]);
+        }
+        
+        await new Promise(resolve => setTimeout(resolve, 200));
+        furnace.close();
+        return true;
+    } catch (e) {
+        return false;
+    }
 }
 
 function getActiveEffects(bot) {
@@ -308,7 +402,7 @@ async function attackMob(bot) {
                     ]);
                     return 1.0;
                 } catch (e) { 
-                    bot.pathfinder.stop();
+                    try { bot.pathfinder.stop(); } catch(err) {}
                     return 0; 
                 }
             }
@@ -320,14 +414,14 @@ async function attackMob(bot) {
 async function mineBlock(bot) {
     if (!bot || !bot.entity || !bot.entity.position) return 0;
     
-    const targets = ['oak_log', 'birch_log', 'spruce_log', 'jungle_log', 'acacia_log', 'dark_oak_log', 'cobblestone', 'iron_ore', 'coal_ore'];
+    const targets = ['diamond_ore', 'deepslate_diamond_ore', 'iron_ore', 'deepslate_iron_ore', 'gold_ore', 'coal_ore', 'oak_log', 'cobblestone'];
     
     try {
         const blockIds = targets.map(name => bot.registry.blocksByName[name]?.id).filter(id => id !== undefined);
         
         const targetBlock = bot.findBlock({
             matching: (block) => {
-                return blockIds.includes(block.type) && bot.canSeeBlock(block);
+                return blockIds.includes(block.type); 
             },
             maxDistance: 6,
             count: 1
@@ -337,9 +431,24 @@ async function mineBlock(bot) {
             const dist = bot.entity.position.distanceTo(targetBlock.position);
             
             if (dist < 4) {
+                await bot.lookAt(targetBlock.position.offset(0.5, 0.5, 0.5));
+                
+                const blockCursor = bot.blockAtCursor(5);
+                
+                if (blockCursor && !blockCursor.position.equals(targetBlock.position) && blockCursor.type !== 0) {
+                     try {
+                        await bot.equip(bot.pathfinder.bestHarvestTool(blockCursor), 'hand');
+                        await bot.dig(blockCursor);
+                        return 1.0;
+                     } catch (e) { return -0.5; }
+                }
+                
                 try {
                     await bot.equip(bot.pathfinder.bestHarvestTool(targetBlock), 'hand');
                     await bot.dig(targetBlock);
+                    
+                    if (targetBlock.name.includes('diamond')) return 50.0;
+                    if (targetBlock.name.includes('iron')) return 20.0;
                     return 10.0;
                 } catch (e) { return -1.0; }
             } else {
@@ -351,7 +460,7 @@ async function mineBlock(bot) {
                         ]);
                         return 1.0;
                     } catch (e) { 
-                        bot.pathfinder.stop();
+                        try { bot.pathfinder.stop(); } catch(err) {}
                         return 0; 
                     }
                 }
@@ -528,10 +637,11 @@ function getObservation(bot, viewRange) {
         globalNearestDist !== Infinity ? globalNearestDist : -1,
         resources.wood,
         resources.stone,
-        resources.iron,
-        resources.food,
+        resources.iron_ingot + resources.iron_ore,
+        resources.cooked_food + resources.raw_food,
         effects.badFx,
-        effects.goodFx
+        effects.goodFx,
+        resources.diamond
     ];
     
     const inventoryIDs = new Array(36).fill(0);
@@ -562,8 +672,13 @@ function getObservation(bot, viewRange) {
         has_weapon: hasWeapon,
         nearest_mob_distance: nearest_distance,
         nearest_mob_type: nearest_mob ? nearest_mob.type : null,
-        wood_count: getWoodCounts(bot)
+        wood_count: resources.wood,
+        stone_count: resources.stone,
+        iron_ore_count: resources.iron_ore,
+        iron_ingot_count: resources.iron_ingot,
+        diamond_count: resources.diamond,
+        cooked_food_count: resources.cooked_food
     };
 }
 
-module.exports = { getObservation, moveControl, sprintJump, randomWander, attackMob, mineBlock, equipBestGear };
+module.exports = { getObservation, moveControl, sprintJump, randomWander, attackMob, mineBlock, equipBestGear, placeBlock, smeltItem };
