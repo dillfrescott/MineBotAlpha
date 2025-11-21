@@ -1,0 +1,25 @@
+{
+    "minecraft": {
+        "host": "127.0.0.1",
+        "port": 25565,
+        "version": "1.21.1",
+        "username_train": "AnimeAndRamen",
+        "username_inference": "AnimeAndRamen",
+        "auth": "microsoft",
+        "view_range": 6
+    },
+    "model": {
+        "num_block_types": 4096,
+        "dim": 512,
+        "depth": 18,
+        "heads": 8,
+        "max_action_history": 10
+    },
+    "training": {
+        "update_batch_size": 1,
+        "learning_rate": 1.0,
+        "gamma": 1.0,
+        "checkpoint_dir": "checkpoints",
+        "save_interval": 1000
+    }
+}

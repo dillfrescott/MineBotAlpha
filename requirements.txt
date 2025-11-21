@@ -1,0 +1,6 @@
+torch
+x-transformers
+prodigyopt
+tqdm
+javascript
+numpy
