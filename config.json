@@ -6,17 +6,17 @@
         "username_train": "AnimeAndRamen",
         "username_inference": "AnimeAndRamen",
         "auth": "microsoft",
-        "view_range": 6
+        "view_range": 3
     },
     "model": {
         "num_block_types": 4096,
-        "dim": 512,
-        "depth": 18,
+        "dim": 1024,
+        "depth": 12,
         "heads": 8,
         "max_action_history": 10
     },
     "training": {
-        "update_batch_size": 1,
+        "update_batch_size": 50,
         "learning_rate": 1.0,
         "gamma": 1.0,
         "checkpoint_dir": "checkpoints",

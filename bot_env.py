@@ -5,6 +5,8 @@ import base64
 import math
 import numpy as np
 from javascript import require, Once, On
+from threading import BrokenBarrierError
+import asyncio
 
 Vec3 = require('vec3')
 
@@ -27,6 +29,7 @@ class MinecraftEnv:
         self.last_food = 20.0
         self.current_health = 20.0
         self.current_food = 20.0
+        self.last_wood_count = 0
         
         self.bot = self.mineflayer.createBot({
             'host': host, 'port': port, 'username': username, 'auth': auth,
@@ -39,7 +42,6 @@ class MinecraftEnv:
         self.action_history = torch.zeros(self.max_actions, 12, device=device)
         
         self.wood_sources = ['oak_log', 'birch_log', 'spruce_log', 'jungle_log', 'acacia_log', 'dark_oak_log']
-        self.mining_targets = self.wood_sources + ['cobblestone', 'iron_ore', 'coal_ore']
         
         @On(self.bot, 'end')
         def on_end(this, reason):
@@ -60,26 +62,6 @@ class MinecraftEnv:
         start = time.time()
         while not self.is_ready and time.time() - start < 60:
             time.sleep(0.1)
-
-    def get_inventory_counts(self):
-        counts = {}
-        try:
-            if not self.bot or not self.bot.inventory or not hasattr(self.bot.inventory, 'items'):
-                return {}
-            
-            if callable(self.bot.inventory.items):
-                items = self.bot.inventory.items()
-            elif isinstance(self.bot.inventory.items, list):
-                items = self.bot.inventory.items
-            else:
-                items = []
-
-            for item in items:
-                name = item.name
-                counts[name] = counts.get(name, 0) + item.count
-        except:
-            pass
-        return counts
 
     def craft_any_item(self):
         try:
@@ -137,41 +119,18 @@ class MinecraftEnv:
                 self.bot.craft(best_recipe, 1, None)
                 return True
                 
-        except Exception:
-            pass
-        return False
-
-    def equip_best_weapon(self):
-        try:
-            if callable(self.bot.inventory.items):
-                inventory_items = self.bot.inventory.items()
-            elif isinstance(self.bot.inventory.items, list):
-                inventory_items = self.bot.inventory.items
-            else:
-                items = []
-
-            weapons = ['iron_sword', 'stone_sword', 'wooden_sword']
-            for weapon in weapons:
-                item = next((i for i in inventory_items if i.name == weapon), None)
-                if item:
-                    self.bot.equip(item, 'hand')
-                    return True
-                    
-            axe = next((i for i in inventory_items if 'axe' in i.name), None)
-            if axe:
-                self.bot.equip(axe, 'hand')
-                return True
-        except:
+        except (BrokenBarrierError, Exception):
             pass
         return False
 
     def get_observation(self):
         dummy_vox = torch.zeros((1, 2, self.grid_len), dtype=torch.long)
         dummy_inv = torch.zeros((1, 1, self.inventory_len), dtype=torch.long)
+        dummy_status = torch.zeros((1, 1, 9), dtype=torch.float)
         
         if not self.is_ready:
             return (dummy_vox,
-                    torch.zeros((1, 1, 9), dtype=torch.float),
+                    dummy_status,
                     dummy_inv,
                     self.action_history.clone().unsqueeze(0))
         
@@ -198,7 +157,6 @@ class MinecraftEnv:
             ]).unsqueeze(0).long()
             
             status_list = list(data['status'])
-            status_list.append(float(data.get('has_weapon', 0)))
             status = torch.tensor([status_list], dtype=torch.float).unsqueeze(0)
             
             inventory_list = list(data['inventory'])
@@ -206,74 +164,14 @@ class MinecraftEnv:
             
             self.current_health = status_list[0]
             self.current_food = status_list[1]
+            self.last_wood_count = data['wood_count']
             
             return voxels, status, inventory, self.action_history.clone().unsqueeze(0)
-        except:
-            return dummy_vox, torch.zeros((1, 1, 9)), dummy_inv, self.action_history.clone().unsqueeze(0)
-
-    async def try_to_mine(self):
-        reward = 0
-        bot = self.bot
-        
-        block_ids = [bot.registry.blocksByName[name].id for name in self.mining_targets if name in bot.registry.blocksByName]
-
-        target_block = bot.findBlock({
-            'matching': block_ids,
-            'maxDistance': 6,
-            'count': 1
-        })
-
-        if target_block:
-            dist = bot.entity.position.distanceTo(target_block.position)
-            if dist < 4:
-                bot.pathfinder.stop()
-                self.tool.equipForBlock(target_block)
-                try:
-                    await bot.dig(target_block)
-                    reward += 10.0
-                except:
-                    reward -= 1.0
-            else:
-                bot.pathfinder.stop()
-                goal = self.pathfinder.goals.GoalBlock(target_block.position.x, target_block.position.y, target_block.position.z)
-                await bot.pathfinder.goto(goal)
-                reward += 1.0
-        return reward
-
-    async def pvp_attack(self):
-        reward = 0
-        bot = self.bot
-        pos = bot.entity.position
-        
-        entity = bot.nearestEntity(lambda e:
-            e and e.position and e.type in ['mob', 'player'] and e.name not in ['sheep', 'cow', 'pig']
-        )
-        
-        if entity and entity.position:
-            dist = entity.position.distanceTo(pos)
-            self.equip_best_weapon()
-            
-            try:
-                if not bot.entities.get(entity.id):
-                    return reward
-                    
-                if dist < 3.5:
-                    bot.pathfinder.stop()
-                    bot.lookAt(entity.position.offset(0, entity.height * 0.5, 0))
-                    bot.attack(entity)
-                    reward += 5.0
-                else:
-                    bot.pathfinder.stop()
-                    goal = self.pathfinder.goals.GoalFollow(entity, 3)
-                    await bot.pathfinder.goto(goal)
-                    reward += 1.0
-            except Exception as e:
-                pass
-        
-        return reward
+        except (BrokenBarrierError, Exception):
+            return dummy_vox, dummy_status, dummy_inv, self.action_history.clone().unsqueeze(0)
 
     async def execute_action(self, action_type):
-        if not self.bot or not self.bot.entity or not self.bot.entity.position:
+        if not self.is_ready:
             return 0
 
         reward = 0
@@ -281,14 +179,10 @@ class MinecraftEnv:
 
         try:
             if action_type == 0:
-                reward += await self.pvp_attack() 
+                reward += await self.helper.attackMob(self.bot)
             
             elif action_type == 1:
-                bot.setControlState("back", True)
-                wait_promise = bot.waitForTicks(4)
-                if wait_promise:
-                    await wait_promise
-                bot.setControlState("back", False)
+                await self.helper.moveControl(bot, "back", 200)
 
             elif action_type == 2:
                 if self.current_health < 10 and bot.food > 8:
@@ -308,39 +202,19 @@ class MinecraftEnv:
                         reward += 3.0
 
             elif action_type == 3:
-                bot.setControlState("forward", True)
-                wait_promise = bot.waitForTicks(4) 
-                if wait_promise:
-                    await wait_promise
-                bot.setControlState("forward", False)
+                await self.helper.moveControl(bot, "forward", 200)
 
             elif action_type == 4:
-                bot.setControlState("back", True)
-                wait_promise = bot.waitForTicks(4)
-                if wait_promise:
-                    await wait_promise
-                bot.setControlState("back", False)
+                await self.helper.moveControl(bot, "back", 200)
 
             elif action_type == 5:
-                bot.setControlState("left", True)
-                wait_promise = bot.waitForTicks(4)
-                if wait_promise:
-                    await wait_promise
-                bot.setControlState("left", False)
+                await self.helper.moveControl(bot, "left", 200)
 
             elif action_type == 6:
-                bot.setControlState("right", True)
-                wait_promise = bot.waitForTicks(4)
-                if wait_promise:
-                    await wait_promise
-                bot.setControlState("right", False)
+                await self.helper.moveControl(bot, "right", 200)
 
             elif action_type == 7:
-                bot.setControlState("jump", True)
-                wait_promise = bot.waitForTicks(2)
-                if wait_promise:
-                    await wait_promise
-                bot.setControlState("jump", False)
+                await self.helper.moveControl(bot, "jump", 100)
 
             elif action_type == 8:
                 yaw = bot.entity.yaw - 0.3
@@ -351,71 +225,68 @@ class MinecraftEnv:
                 bot.look(yaw, bot.entity.pitch)
             
             elif action_type == 10:
-                reward += await self.try_to_mine()
+                reward += await self.helper.mineBlock(self.bot)
                 
             elif action_type == 11:
-                reward += await self.pvp_attack()
+                reward += await self.helper.attackMob(self.bot)
                 
-        except Exception as e:
+        except (BrokenBarrierError, Exception):
             return 0
 
         return reward
 
     async def step_atomic(self, action, craft_action):
         if not self.is_ready: 
-            print("Bot is not ready/disconnected")
             return 0
             
         reward = 0
         
-        reward += await self.execute_action(action.item())
-        
-        if craft_action.item() == 0:
-            if self.craft_any_item():
-                reward += 10.0
-        
         try:
-            counts = self.get_inventory_counts()
-            wood = sum(counts.get(log, 0) for log in self.wood_sources)
-            planks = counts.get('planks', 0)
-            if wood > 0 or planks > 0:
+            reward += await self.execute_action(action.item())
+            
+            if craft_action.item() == 0:
+                if self.craft_any_item():
+                    reward += 10.0
+            
+            if self.last_wood_count > 0:
                 reward += 0.1
-        except:
-            pass
+                
+            try:
+                if self.current_food < 6:
+                    reward -= 0.5
+                elif self.current_food == 0:
+                    reward -= 2.0
+                    
+                if self.current_health < 5:
+                    reward -= 1.0
+                    
+                damage_taken = max(0, self.last_health - self.current_health)
+                if damage_taken > 0:
+                    reward -= damage_taken * 5.0
+                    
+                health_gained = max(0, self.current_health - self.last_health)
+                if health_gained > 0:
+                    reward += health_gained * 1.5
+                    
+            except:
+                pass
+                
+            self.last_health = self.current_health
+            self.last_food = self.current_food
             
-        try:
-            if self.current_food < 6:
-                reward -= 0.5
-            elif self.current_food == 0:
-                reward -= 2.0
-                
-            if self.current_health < 5:
-                reward -= 1.0
-                
-            damage_taken = max(0, self.last_health - self.current_health)
-            if damage_taken > 0:
-                reward -= damage_taken * 5.0
-                
-            health_gained = max(0, self.current_health - self.last_health)
-            if health_gained > 0:
-                reward += health_gained * 1.5
-                
-        except:
-            pass
+            device = self.action_history.device
+            B = action.size(0)
+
+            new_action_full = torch.cat([
+                torch.nn.functional.one_hot(action, num_classes=12).float(),
+                torch.nn.functional.one_hot(craft_action, num_classes=4).float(),
+            ], dim=-1)
+
+            new_action = new_action_full[:, :12]
+
+            self.action_history = torch.cat([self.action_history[1:], new_action])
             
-        self.last_health = self.current_health
-        self.last_food = self.current_food
-        
-        device = self.action_history.device
-        B = action.size(0)
-
-        new_action_full = torch.cat([
-            torch.nn.functional.one_hot(action, num_classes=12).float(),
-            torch.nn.functional.one_hot(craft_action, num_classes=4).float(),
-        ], dim=-1)
-
-        new_action = new_action_full[:, :12]
-
-        self.action_history = torch.cat([self.action_history[1:], new_action])
+        except (BrokenBarrierError, Exception):
+            pass
         
         return reward

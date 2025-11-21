@@ -1,0 +1,1 @@
+npm install mineflayer mineflayer-pathfinder mineflayer-tool vec3
