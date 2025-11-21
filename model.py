@@ -70,7 +70,7 @@ class MinecraftAgent(nn.Module):
         )
         self.spatial_norm = nn.LayerNorm(self.dim)
         
-        self.status_emb = nn.Linear(12 + self.max_actions * 15, self.dim)
+        self.status_emb = nn.Linear(22 + self.max_actions * 15, self.dim)
         
         self.transformer = Encoder(
             dim=self.dim,
@@ -122,13 +122,16 @@ class MinecraftAgent(nn.Module):
         x_vox = x_vox.unsqueeze(1)
         
         raw_status = status.squeeze(1)
-        core_status = raw_status[:, :12]
-        coords = raw_status[:, 12:]
+        
+        stats_and_home = raw_status[:, :12]
+        coords = raw_status[:, 12:15]
+        events_and_radar = raw_status[:, 15:]
         
         x_coords = self.coord_emb(coords).unsqueeze(1)
         
         act_flat = action_history.reshape(B, -1)
-        status_input = torch.cat([core_status, act_flat], dim=-1)
+        
+        status_input = torch.cat([stats_and_home, events_and_radar, act_flat], dim=-1)
         x_stat = self.status_emb(status_input).unsqueeze(1)
         
         inventory_ids = inventory.squeeze(1)

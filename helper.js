@@ -2,6 +2,7 @@ const { goals } = require('mineflayer-pathfinder');
 const Vec3 = require('vec3');
 
 const hostile = new Set();
+let lastBlockBreak = { type: 0, by: 0, time: 0 };
 
 function getStableId(name) {
     if (!name) return 0;
@@ -13,12 +14,54 @@ function getStableId(name) {
     return Math.abs(hash) % 4096;
 }
 
+function getLookVector(pitch, yaw) {
+    const sinYaw = Math.sin(yaw);
+    const cosYaw = Math.cos(yaw);
+    const sinPitch = Math.sin(pitch);
+    const cosPitch = Math.cos(pitch);
+    return new Vec3(-cosPitch * sinYaw, sinPitch, -cosPitch * cosYaw);
+}
+
 function setupListeners(bot) {
     if (!bot._listenersAttached) {
         bot._listenersAttached = true;
 
         bot.on('entitySwing', (entity) => {
             entity.lastSwung = Date.now();
+        });
+
+        bot.on('blockUpdate', (oldBlock, newBlock) => {
+            if (oldBlock && oldBlock.type !== 0 && newBlock.type === 0) {
+                const blockPos = oldBlock.position.offset(0.5, 0.5, 0.5);
+                let bestCandidate = 0;
+                let minDot = 0.5;
+
+                for (const name in bot.entities) {
+                    const entity = bot.entities[name];
+                    if (entity === bot.entity || !entity.position) continue;
+                    if (entity.type !== 'player') continue;
+
+                    const dist = entity.position.distanceTo(blockPos);
+                    if (dist > 6) continue;
+
+                    const look = getLookVector(entity.pitch, entity.yaw);
+                    const toBlock = blockPos.minus(entity.position.offset(0, 1.62, 0)).normalize();
+                    const dot = look.dot(toBlock);
+
+                    if (dot > minDot) {
+                        minDot = dot;
+                        bestCandidate = getStableId(entity.username);
+                    }
+                }
+
+                if (bestCandidate !== 0) {
+                    lastBlockBreak = {
+                        type: getStableId(oldBlock.name),
+                        by: bestCandidate,
+                        time: Date.now()
+                    };
+                }
+            }
         });
 
         bot.on('entityHurt', (entity) => {
@@ -198,18 +241,23 @@ async function equipBestGear(bot) {
     }
 }
 
-function getWoodCounts(bot) {
-    if (!bot || !bot.inventory) return 0;
+function getResourceSummary(bot) {
+    if (!bot || !bot.inventory) return { wood: 0, stone: 0, iron: 0, food: 0 };
+    
     const items = bot.inventory.items();
-    let count = 0;
-    const woods = ['oak_log', 'birch_log', 'spruce_log', 'jungle_log', 'acacia_log', 'dark_oak_log', 'planks'];
+    let wood = 0;
+    let stone = 0;
+    let iron = 0;
+    let food = 0;
     
     for (const item of items) {
-        if (woods.includes(item.name) || item.name.includes('planks')) {
-            count += item.count;
-        }
+        if (item.name.includes('log') || item.name.includes('planks')) wood += item.count;
+        if (item.name.includes('cobblestone') || item.name.includes('stone')) stone += item.count;
+        if (item.name.includes('iron_ingot') || item.name.includes('iron_ore')) iron += item.count;
+        if (item.name.includes('beef') || item.name.includes('pork') || item.name.includes('chicken') || item.name.includes('bread') || item.name.includes('apple')) food += item.count;
     }
-    return count;
+    
+    return { wood, stone, iron, food };
 }
 
 async function attackMob(bot) {
@@ -398,6 +446,21 @@ function getObservation(bot, viewRange) {
         }
     }
 
+    let globalNearestPlayer = null;
+    let globalNearestDist = Infinity;
+
+    for (const name in bot.entities) {
+        const entity = bot.entities[name];
+        if (entity === bot.entity || !entity.position) continue;
+        if (entity.type === 'player') {
+             const d = entity.position.distanceTo(bot.entity.position);
+             if (d < globalNearestDist) {
+                 globalNearestDist = d;
+                 globalNearestPlayer = entity.position;
+             }
+        }
+    }
+
     const bot_entity = bot.entity;
     const vel = bot_entity ? bot_entity.velocity : null;
     const pos = bot_entity ? bot_entity.position : {x:0, y:0, z:0};
@@ -407,6 +470,16 @@ function getObservation(bot, viewRange) {
     const vel_x = vel ? vel.x : 0;
     const vel_y = vel ? vel.y : 0;
     const vel_z = vel ? vel.z : 0;
+    
+    let brokenType = 0;
+    let breakerId = 0;
+    
+    if (Date.now() - lastBlockBreak.time < 1000) {
+        brokenType = lastBlockBreak.type;
+        breakerId = lastBlockBreak.by;
+    }
+
+    const resources = getResourceSummary(bot);
 
     const status = [
         bot.health || 0,
@@ -420,7 +493,17 @@ function getObservation(bot, viewRange) {
         nearest_mob ? (16 - Math.min(nearest_distance, 16)) / 16 : 0,
         pos.x,
         pos.y,
-        pos.z
+        pos.z,
+        brokenType,
+        breakerId,
+        globalNearestPlayer ? (globalNearestPlayer.x - pos.x) : 0,
+        globalNearestPlayer ? (globalNearestPlayer.y - pos.y) : 0,
+        globalNearestPlayer ? (globalNearestPlayer.z - pos.z) : 0,
+        globalNearestDist !== Infinity ? globalNearestDist : -1,
+        resources.wood,
+        resources.stone,
+        resources.iron,
+        resources.food
     ];
     
     const inventoryIDs = new Array(36).fill(0);

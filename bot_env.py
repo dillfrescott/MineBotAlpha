@@ -139,7 +139,7 @@ class MinecraftEnv:
     def get_observation(self):
         dummy_vox = torch.zeros((1, 8, self.grid_len), dtype=torch.long)
         dummy_inv = torch.zeros((1, 1, self.inventory_len), dtype=torch.long)
-        dummy_status = torch.zeros((1, 1, 15), dtype=torch.float)
+        dummy_status = torch.zeros((1, 1, 25), dtype=torch.float)
         
         if not self.is_ready:
             return (dummy_vox,
