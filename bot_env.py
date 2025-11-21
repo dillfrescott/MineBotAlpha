@@ -139,7 +139,7 @@ class MinecraftEnv:
     def get_observation(self):
         dummy_vox = torch.zeros((1, 8, self.grid_len), dtype=torch.long)
         dummy_inv = torch.zeros((1, 1, self.inventory_len), dtype=torch.long)
-        dummy_status = torch.zeros((1, 1, 25), dtype=torch.float)
+        dummy_status = torch.zeros((1, 1, 28), dtype=torch.float)
         
         if not self.is_ready:
             return (dummy_vox,
@@ -185,7 +185,7 @@ class MinecraftEnv:
             status_list = list(data['status'])
             
             if self.enable_home:
-                current_pos = np.array([status_list[9], status_list[10], status_list[11]])
+                current_pos = np.array([status_list[10], status_list[11], status_list[12]])
                 home_vec = np.array(self.home_coords) - current_pos
                 dist_home = np.linalg.norm(home_vec)
                 if dist_home > 0:
@@ -194,10 +194,10 @@ class MinecraftEnv:
                     dir_home = np.zeros(3)
             else:
                 dir_home = np.zeros(3)
-                
-            status_list.insert(9, dir_home[0])
-            status_list.insert(10, dir_home[1])
-            status_list.insert(11, dir_home[2])
+            
+            status_list.insert(10, dir_home[0])
+            status_list.insert(11, dir_home[1])
+            status_list.insert(12, dir_home[2])
             
             status = torch.tensor([status_list], dtype=torch.float).unsqueeze(0)
             
@@ -208,7 +208,7 @@ class MinecraftEnv:
             self.current_food = status_list[1]
             self.last_wood_count = data['wood_count']
             
-            current_pos = np.array([status_list[12], status_list[13], status_list[14]])
+            current_pos = np.array([status_list[13], status_list[14], status_list[15]])
             
             if self.last_position is not None:
                 dist = np.linalg.norm(current_pos - self.last_position)

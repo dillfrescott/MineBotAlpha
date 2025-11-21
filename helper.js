@@ -260,6 +260,21 @@ function getResourceSummary(bot) {
     return { wood, stone, iron, food };
 }
 
+function getActiveEffects(bot) {
+    let badFx = 0;
+    let goodFx = 0;
+    
+    if (bot.entity && bot.entity.effects) {
+        const effects = Object.values(bot.entity.effects);
+        for (const eff of effects) {
+             const id = eff.id;
+             if ([19, 20, 2, 18, 7, 15, 9, 17, 27].includes(id)) badFx = 1;
+             if ([10, 1, 5, 11, 12, 22, 8, 16, 26].includes(id)) goodFx = 1;
+        }
+    }
+    return { badFx, goodFx };
+}
+
 async function attackMob(bot) {
     if (!bot || !bot.entity || !bot.entity.position) return 0;
     setupListeners(bot);
@@ -404,12 +419,21 @@ function getObservation(bot, viewRange) {
                 const data_offset = idx * 15;
                 let entityId = 2000;
                 if (entity.type === 'player') entityId = 2001;
-                if (entity.type === 'projectile') entityId = 2002;
+                if (entity.type === 'projectile') {
+                    entityId = 2002;
+                    if (entity.name && (entity.name.includes('potion') || entity.metadata[8] === 1)) {
+                        entityId = 2005;
+                    }
+                }
                 if (entity.type === 'object') {
                     entityId = 2003;
-                    const item = entity.getDroppedItem ? entity.getDroppedItem() : null;
-                    if (item) {
-                        entityId = getStableId(item.name);
+                    if (entity.objectType === 'Thrown Potion' || entity.name === 'thrown_potion') {
+                        entityId = 2005;
+                    } else {
+                        const item = entity.getDroppedItem ? entity.getDroppedItem() : null;
+                        if (item) {
+                            entityId = getStableId(item.name);
+                        }
                     }
                 }
 
@@ -480,11 +504,13 @@ function getObservation(bot, viewRange) {
     }
 
     const resources = getResourceSummary(bot);
+    const effects = getActiveEffects(bot);
 
     const status = [
         bot.health || 0,
         bot.food || 0,
         bot.foodSaturation || 0,
+        bot.oxygenLevel || 0,
         yaw,
         pitch,
         vel_x,
@@ -503,7 +529,9 @@ function getObservation(bot, viewRange) {
         resources.wood,
         resources.stone,
         resources.iron,
-        resources.food
+        resources.food,
+        effects.badFx,
+        effects.goodFx
     ];
     
     const inventoryIDs = new Array(36).fill(0);
