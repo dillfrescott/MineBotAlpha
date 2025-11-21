@@ -12,14 +12,15 @@ import asyncio
 import sys
 
 class A2CAgent:
-    def __init__(self, model, lr=1.0, value_coef=0.5, entropy_coef=0.01):
+    def __init__(self, model, lr=1.0, value_coef=0.5, entropy_coef=0.01, dynamics_coef=0.5):
         self.model = model
         self.optimizer = Prodigy(model.parameters(), lr=lr)
         self.value_coef = value_coef
         self.entropy_coef = entropy_coef
+        self.dynamics_coef = dynamics_coef
     
     def act(self, voxels, status, inventory, action_history, hx):
-        action_logits, craft_logits, value, next_hx = self.model(voxels, status, inventory, action_history, hx)
+        action_logits, craft_logits, value, next_hx, _, _ = self.model(voxels, status, inventory, action_history, hx)
         
         action_dist = torch.distributions.Categorical(logits=action_logits)
         craft_dist = torch.distributions.Categorical(logits=craft_logits)
@@ -35,11 +36,14 @@ class A2CAgent:
         return (action, craft_action), (action_logp, craft_logp), value, entropy, next_hx
     
     def update(self, batch):
-        vox, stat, inv, act_hist, hx, old_logps, actions, returns = batch
+        vox, stat, inv, act_hist, hx, old_logps, actions, returns, next_hx_target = batch
         action_old, craft_old = actions
         action_logp_old, craft_logp_old = old_logps
         
-        action_logits, craft_logits, values, _ = self.model(vox, stat, inv, act_hist, hx)
+        if action_old.dim() > 1:
+            action_old = action_old.squeeze(-1)
+        
+        action_logits, craft_logits, values, current_hx, pred_next_states, pred_rewards = self.model(vox, stat, inv, act_hist, hx)
         
         device = action_logits.device
         action_old = action_old.to(device)
@@ -59,14 +63,25 @@ class A2CAgent:
         
         value_loss = F.mse_loss(values, returns)
         
-        total_loss = policy_loss + self.value_coef * value_loss - self.entropy_coef * entropy
+        batch_indices = torch.arange(pred_next_states.size(0), device=device)
+        
+        selected_next_states = pred_next_states[batch_indices, action_old]
+        selected_rewards = pred_rewards[batch_indices, action_old].squeeze(-1)
+        
+        dynamics_loss = F.mse_loss(selected_next_states, next_hx_target.detach()) + \
+                        F.mse_loss(selected_rewards, returns) 
+        
+        total_loss = policy_loss + \
+                     self.value_coef * value_loss - \
+                     self.entropy_coef * entropy + \
+                     self.dynamics_coef * dynamics_loss
         
         self.optimizer.zero_grad()
         total_loss.backward()
         nn.utils.clip_grad_norm_(self.model.parameters(), 0.5)
         self.optimizer.step()
         
-        return total_loss.item(), policy_loss.item(), value_loss.item(), entropy.item()
+        return total_loss.item(), policy_loss.item(), value_loss.item(), entropy.item(), dynamics_loss.item()
 
 async def train():
     cfg = json.load(open('config.json'))
@@ -126,7 +141,7 @@ async def train():
 
         buffer = {
             'vox': [], 'stat': [], 'inv': [], 'act_hist': [], 'hx': [],
-            'actions': [], 'logps': [], 'rewards': [], 'values': []
+            'actions': [], 'logps': [], 'rewards': [], 'values': [], 'next_hx': []
         }
         
         try:
@@ -164,6 +179,7 @@ async def train():
                 buffer['logps'].append((action_logp.cpu(), craft_logp.cpu()))
                 buffer['rewards'].append(reward)
                 buffer['values'].append(value.cpu())
+                buffer['next_hx'].append(next_hx.detach().cpu()) 
                 
                 hx = next_hx.detach()
 
@@ -181,6 +197,11 @@ async def train():
                 returns.insert(0, R)
             returns = torch.tensor(returns, dtype=torch.float32, device=device)
             
+            # Ensure next_hx_target has correct shape by squeezing if necessary
+            next_hx_target = torch.cat(buffer['next_hx']).to(device)
+            if next_hx_target.dim() > 2: 
+                 next_hx_target = next_hx_target.squeeze(1)
+
             batch = (
                 torch.cat(buffer['vox']).to(device),
                 torch.cat(buffer['stat']).to(device),
@@ -191,14 +212,15 @@ async def train():
                  torch.stack([lp[1] for lp in buffer['logps']]).to(device)),
                 (torch.stack([a[0] for a in buffer['actions']]).to(device),
                  torch.stack([a[1] for a in buffer['actions']]).to(device)),
-                returns
+                returns,
+                next_hx_target
             )
             
-            loss, p_loss, v_loss, ent = agent.update(batch)
+            loss, p_loss, v_loss, ent, dyn_loss = agent.update(batch)
             pbar.set_postfix({
-                "Reward": f"{sum(buffer['rewards']):.2f}",
-                "Loss": f"{loss:.3f}",
-                "Ent": f"{ent:.3f}"
+                "Rew": f"{sum(buffer['rewards']):.1f}",
+                "Loss": f"{loss:.2f}",
+                "Dyn": f"{dyn_loss:.2f}"
             })
             
             if global_step % save_interval < update_batch_size:
@@ -219,6 +241,8 @@ async def train():
                 await asyncio.sleep(5)
             else:
                 print(f"Training error: {e}")
+                import traceback
+                traceback.print_exc()
                 continue
     
     env.close()

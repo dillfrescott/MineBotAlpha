@@ -30,6 +30,8 @@ class MinecraftEnv:
         self.current_health = 20.0
         self.current_food = 20.0
         self.last_wood_count = 0
+        self.last_position = None
+        self.same_pos_counter = 0
         
         self.bot = self.mineflayer.createBot({
             'host': host, 'port': port, 'username': username, 'auth': auth,
@@ -39,7 +41,7 @@ class MinecraftEnv:
         self.bot.loadPlugin(self.pathfinder.pathfinder)
         self.tool = require('mineflayer-tool').Tool(self.bot)
         self.is_ready = False
-        self.action_history = torch.zeros(self.max_actions, 12, device=device)
+        self.action_history = torch.zeros(self.max_actions, 15, device=device)
         
         self.wood_sources = ['oak_log', 'birch_log', 'spruce_log', 'jungle_log', 'acacia_log', 'dark_oak_log']
         
@@ -124,7 +126,7 @@ class MinecraftEnv:
         return False
 
     def get_observation(self):
-        dummy_vox = torch.zeros((1, 2, self.grid_len), dtype=torch.long)
+        dummy_vox = torch.zeros((1, 8, self.grid_len), dtype=torch.long)
         dummy_inv = torch.zeros((1, 1, self.inventory_len), dtype=torch.long)
         dummy_status = torch.zeros((1, 1, 9), dtype=torch.float)
         
@@ -140,20 +142,33 @@ class MinecraftEnv:
             
             raw_bytes = base64.b64decode(data['voxels'])
             raw_data = np.frombuffer(raw_bytes, dtype=np.uint8)
-            light_levels = raw_data[2::3].astype(np.int64)
             
+            light_levels = raw_data[2::15].astype(np.int64)
             light_levels = np.clip(light_levels, 0, 16)
 
-            id_b1 = raw_data[0::3]
-            id_b2 = raw_data[1::3]
-            id_bytes_2d = np.stack([id_b1, id_b2], axis=-1).ravel()
-            block_ids = np.frombuffer(id_bytes_2d.tobytes(), dtype='<u2').astype(np.int64)
-            
-            block_ids = np.clip(block_ids, 0, 4095) 
+            def extract_u16(offset):
+                b1 = raw_data[offset::15]
+                b2 = raw_data[offset+1::15]
+                packed = np.stack([b1, b2], axis=-1).ravel()
+                return np.frombuffer(packed.tobytes(), dtype='<u2').astype(np.int64)
+
+            block_ids = np.clip(extract_u16(0), 0, 4095)
+            hand_ids = np.clip(extract_u16(3), 0, 4095)
+            helm_ids = np.clip(extract_u16(5), 0, 4095)
+            chest_ids = np.clip(extract_u16(7), 0, 4095)
+            leg_ids = np.clip(extract_u16(9), 0, 4095)
+            boot_ids = np.clip(extract_u16(11), 0, 4095)
+            name_ids = np.clip(extract_u16(13), 0, 4095)
             
             voxels = torch.stack([
                 torch.from_numpy(block_ids),
-                torch.from_numpy(light_levels)
+                torch.from_numpy(light_levels),
+                torch.from_numpy(hand_ids),
+                torch.from_numpy(helm_ids),
+                torch.from_numpy(chest_ids),
+                torch.from_numpy(leg_ids),
+                torch.from_numpy(boot_ids),
+                torch.from_numpy(name_ids)
             ]).unsqueeze(0).long()
             
             status_list = list(data['status'])
@@ -166,6 +181,15 @@ class MinecraftEnv:
             self.current_food = status_list[1]
             self.last_wood_count = data['wood_count']
             
+            current_pos = np.array([status_list[9], status_list[10], status_list[11]])
+            if self.last_position is not None:
+                dist = np.linalg.norm(current_pos - self.last_position)
+                if dist < 0.5:
+                    self.same_pos_counter += 1
+                else:
+                    self.same_pos_counter = 0
+            self.last_position = current_pos
+
             return voxels, status, inventory, self.action_history.clone().unsqueeze(0)
         except (BrokenBarrierError, Exception):
             return dummy_vox, dummy_status, dummy_inv, self.action_history.clone().unsqueeze(0)
@@ -202,7 +226,7 @@ class MinecraftEnv:
                         reward += 3.0
 
             elif action_type == 3:
-                await self.helper.moveControl(bot, "forward", 200)
+                await self.helper.moveControl(bot, "forward", 500)
 
             elif action_type == 4:
                 await self.helper.moveControl(bot, "back", 200)
@@ -229,6 +253,18 @@ class MinecraftEnv:
                 
             elif action_type == 11:
                 reward += await self.helper.attackMob(self.bot)
+            
+            elif action_type == 12:
+                await self.helper.equipBestGear(self.bot)
+                reward += 0.1
+                
+            elif action_type == 13:
+                await self.helper.sprintJump(bot, 800)
+                reward += 0.2
+                
+            elif action_type == 14:
+                success = await self.helper.randomWander(bot, 32)
+                if success: reward += 0.5
                 
         except (BrokenBarrierError, Exception):
             return 0
@@ -267,6 +303,9 @@ class MinecraftEnv:
                 health_gained = max(0, self.current_health - self.last_health)
                 if health_gained > 0:
                     reward += health_gained * 1.5
+
+                if self.same_pos_counter > 50:
+                    reward -= 0.2 
                     
             except:
                 pass
@@ -278,11 +317,11 @@ class MinecraftEnv:
             B = action.size(0)
 
             new_action_full = torch.cat([
-                torch.nn.functional.one_hot(action, num_classes=12).float(),
+                torch.nn.functional.one_hot(action, num_classes=15).float(),
                 torch.nn.functional.one_hot(craft_action, num_classes=4).float(),
             ], dim=-1)
 
-            new_action = new_action_full[:, :12]
+            new_action = new_action_full[:, :15]
 
             self.action_history = torch.cat([self.action_history[1:], new_action])
             

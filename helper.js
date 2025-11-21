@@ -1,4 +1,5 @@
 const { goals } = require('mineflayer-pathfinder');
+const Vec3 = require('vec3');
 
 function getStableId(name) {
     if (!name) return 0;
@@ -7,7 +8,31 @@ function getStableId(name) {
         hash = (hash << 5) - hash + name.charCodeAt(i);
         hash |= 0;
     }
-    return Math.abs(hash) % 1024;
+    return Math.abs(hash) % 4096;
+}
+
+function hasLineOfSight(bot, target) {
+    if (!bot || !target || !target.position) return false;
+    
+    const eyePos = bot.entity.position.offset(0, bot.entity.height, 0);
+    const targetPos = target.position.offset(0, target.height * 0.5, 0);
+    
+    const dist = eyePos.distanceTo(targetPos);
+    const dir = targetPos.minus(eyePos).normalize();
+    
+    const step = 0.5;
+    let currentDist = 0;
+    
+    while (currentDist < dist) {
+        const checkPos = eyePos.plus(dir.scaled(currentDist));
+        const block = bot.blockAt(checkPos);
+        
+        if (block && block.boundingBox === 'block') {
+            return false;
+        }
+        currentDist += step;
+    }
+    return true;
 }
 
 async function moveControl(bot, control, ms) {
@@ -19,6 +44,46 @@ async function moveControl(bot, control, ms) {
     bot.setControlState(control, true);
     await new Promise(resolve => setTimeout(resolve, ms));
     bot.setControlState(control, false);
+}
+
+async function sprintJump(bot, ms) {
+    if (!bot || !bot.entity) return;
+    try {
+        if (bot.pathfinder) bot.pathfinder.stop();
+    } catch (e) {}
+    
+    bot.setControlState('forward', true);
+    bot.setControlState('sprint', true);
+    bot.setControlState('jump', true);
+    
+    await new Promise(resolve => setTimeout(resolve, ms));
+    
+    bot.setControlState('forward', false);
+    bot.setControlState('sprint', false);
+    bot.setControlState('jump', false);
+}
+
+async function randomWander(bot, radius) {
+    if (!bot || !bot.entity || !bot.pathfinder) return false;
+    
+    const angle = Math.random() * Math.PI * 2;
+    const dist = Math.random() * (radius - 5) + 5; 
+    
+    const dx = Math.cos(angle) * dist;
+    const dz = Math.sin(angle) * dist;
+    
+    const targetPos = bot.entity.position.offset(dx, 0, dz);
+    
+    try {
+        await Promise.race([
+            bot.pathfinder.goto(new goals.GoalNear(targetPos.x, targetPos.y, targetPos.z, 1)),
+            new Promise((_, reject) => setTimeout(() => reject(new Error('Timeout')), 5000))
+        ]);
+        return true;
+    } catch (e) {
+        bot.pathfinder.stop();
+        return false;
+    }
 }
 
 async function equipBestWeapon(bot) {
@@ -44,6 +109,46 @@ async function equipBestWeapon(bot) {
         } catch (e) { return false; }
     }
     return false;
+}
+
+async function equipBestGear(bot) {
+    if (!bot || !bot.inventory) return false;
+    const items = bot.inventory.items();
+    const armorSlots = ['head', 'torso', 'legs', 'feet'];
+    const armorKeywords = ['helmet', 'chestplate', 'leggings', 'boots'];
+    
+    await equipBestWeapon(bot);
+    
+    for (let i = 0; i < 4; i++) {
+        const keyword = armorKeywords[i];
+        const slot = armorSlots[i];
+        
+        let bestItem = null;
+        let bestRank = -1;
+        
+        items.forEach(item => {
+            if (item.name.includes(keyword)) {
+                let rank = 0;
+                if (item.name.includes('leather')) rank = 1;
+                if (item.name.includes('gold')) rank = 2;
+                if (item.name.includes('chainmail')) rank = 3;
+                if (item.name.includes('iron')) rank = 4;
+                if (item.name.includes('diamond')) rank = 5;
+                if (item.name.includes('netherite')) rank = 6;
+                
+                if (rank > bestRank) {
+                    bestRank = rank;
+                    bestItem = item;
+                }
+            }
+        });
+        
+        if (bestItem) {
+            try {
+                await bot.equip(bestItem, slot);
+            } catch (e) {}
+        }
+    }
 }
 
 function getWoodCounts(bot) {
@@ -72,10 +177,12 @@ async function attackMob(bot) {
         if (!entity) return 0;
 
         const dist = bot.entity.position.distanceTo(entity.position);
-        await equipBestWeapon(bot);
-
+        
         if (dist < 3.5) {
-            bot.lookAt(entity.position.offset(0, entity.height * 0.5, 0));
+            if (!hasLineOfSight(bot, entity)) return 0;
+
+            await equipBestWeapon(bot);
+            await bot.lookAt(entity.position.offset(0, entity.height * 0.5, 0));
             bot.attack(entity);
             return 5.0;
         } else {
@@ -152,7 +259,7 @@ function getObservation(bot, viewRange) {
     const width = viewRange * 2 + 1;
     const totalSize = width * width * width;
     
-    const buffer = Buffer.alloc(totalSize * 3);
+    const buffer = Buffer.alloc(totalSize * 15);
     
     const getIndex = (x, y, z) => {
         const lx = x + viewRange;
@@ -167,7 +274,7 @@ function getObservation(bot, viewRange) {
             for (let x = -viewRange; x <= viewRange; x++) {
                 const idx = getIndex(x, y, z);
                 if (idx === -1) continue;
-                const data_offset = idx * 3;
+                const data_offset = idx * 15;
                 
                 const block = bot.blockAt(center.offset(x, y, z));
                 
@@ -194,13 +301,30 @@ function getObservation(bot, viewRange) {
 
             const idx = getIndex(dx, dy, dz);
             if (idx !== -1) {
-                const data_offset = idx * 3;
+                const data_offset = idx * 15;
                 let entityId = 2000;
                 if (entity.type === 'player') entityId = 2001;
                 if (entity.type === 'projectile') entityId = 2002;
 
                 buffer.writeUInt16LE(entityId, data_offset);
                 buffer.writeUInt8(Math.max(0, entity.health || 0), data_offset + 2);
+                
+                const equipment = entity.equipment || [];
+                const hand = equipment[0] ? getStableId(equipment[0].name) : 0;
+                const head = equipment[5] ? getStableId(equipment[5].name) : 0;
+                const chest = equipment[4] ? getStableId(equipment[4].name) : 0;
+                const legs = equipment[3] ? getStableId(equipment[3].name) : 0;
+                const feet = equipment[2] ? getStableId(equipment[2].name) : 0;
+                
+                buffer.writeUInt16LE(hand, data_offset + 3);
+                buffer.writeUInt16LE(head, data_offset + 5);
+                buffer.writeUInt16LE(chest, data_offset + 7);
+                buffer.writeUInt16LE(legs, data_offset + 9);
+                buffer.writeUInt16LE(feet, data_offset + 11);
+                
+                let nameToHash = entity.username || entity.name || "";
+                const nameId = getStableId(nameToHash);
+                buffer.writeUInt16LE(nameId, data_offset + 13);
             }
             
             const distance = entity.position.distanceTo(bot.entity.position);
@@ -268,4 +392,4 @@ function getObservation(bot, viewRange) {
     };
 }
 
-module.exports = { getObservation, moveControl, attackMob, mineBlock };
+module.exports = { getObservation, moveControl, sprintJump, randomWander, attackMob, mineBlock, equipBestGear };
